@@ -1,0 +1,449 @@
+# 🌾 Control de Plagas con Sensores de Movimiento
+
+## 📋 Descripción del Proyecto
+Sistema IoT para detección y control preventivo de plagas en cultivos utilizando sensores de movimiento PIR, cámaras de trampeo y actuadores automáticos para disuadir animales plaga.
+
+## 🎯 Objetivos
+- Detectar movimiento de animales plaga en tiempo real
+- Activar mecanismos de disuasión automáticos  
+- Registrar patrones de actividad de plagas
+- Generar alertas tempranas para agricultores
+- Reducir daños en cultivos de forma ecológica
+
+## 🏗️ Arquitectura del Sistema
+
+```mermaid
+graph TB
+    A[Sensor PIR<br>Movimiento] --> B[NodeMCU ESP32]
+    C[Cámara ESP32-CAM<br>Captura imagen] --> B
+    D[Sensor Ultrasónico<br>Distancia] --> B
+    E[Sensor Humedad/Temperatura<br>DHT22] --> B
+    
+    B --> F[Broker MQTT<br>Mosquitto]
+    F --> G[Base de Datos<br>InfluxDB]
+    F --> H[Almacenamiento Imágenes<br>Local/S3]
+    
+    G --> I[Dashboard<br>Grafana]
+    G --> J[Sistema de Alertas<br>Python]
+    
+    B --> K[Actuadores<br>Disuasores]
+    K --> L[LEDs Strobe]
+    K --> M[Sonido Ultrasónico]
+    K --> N[Sprinkler Agua]
+    
+    J --> O[Notificaciones<br>Telegram/Email]
+    I --> P[Agricultor/<br>Técnico]
+```
+
+## 📦 Stack Tecnológico
+
+| Componente | Tecnología | Propósito |
+|------------|------------|-----------|
+| **Detección** | Sensor PIR HC-SR501, Ultrasonic HC-SR04 | Movimiento y proximidad |
+| **Imágenes** | ESP32-CAM | Verificación visual |
+| **Microcontrolador** | NodeMCU ESP32 | Procesamiento y control |
+| **Protocolo** | MQTT | Comunicación IoT |
+| **Base de Datos** | InfluxDB | Métricas time-series |
+| **Visualización** | Grafana | Dashboard y monitoreo |
+| **Actuadores** | Relés, LEDs, Altavoz | Disuasión de plagas |
+| **Notificaciones** | Telegram Bot | Alertas inmediatas |
+
+## 🔧 Implementación
+
+### 1. Código del Sensor Principal (ESP32)
+
+```cpp
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <HC-SR04.h>
+
+// Configuración WiFi
+const char* ssid = "Farm_Network";
+const char* password = "secure_password";
+
+// Configuración MQTT
+const char* mqtt_server = "192.168.1.100";
+const char* mqtt_topic_motion = "pest/motion";
+const char* mqtt_topic_alert = "pest/alert";
+
+// Pines
+const int pirPin = 4;
+const int ultrasonicTrig = 5;
+const int ultrasonicEcho = 6;
+const int strobeLed = 12;
+const int speakerPin = 13;
+
+// Variables
+bool motionDetected = false;
+long lastDetectionTime = 0;
+int detectionCount = 0;
+
+HCSR04 hcsr04(ultrasonicTrig, ultrasonicEcho);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(pirPin, INPUT);
+  pinMode(strobeLed, OUTPUT);
+  pinMode(speakerPin, OUTPUT);
+  
+  setupWiFi();
+  setupMQTT();
+}
+
+void loop() {
+  checkMotion();
+  checkClientConnection();
+  delay(500);
+}
+
+void checkMotion() {
+  bool currentMotion = digitalRead(pirPin);
+  float distance = hcsr04.distance();
+  
+  if (currentMotion && distance < 300) { // Movimiento dentro de 3m
+    motionDetected = true;
+    lastDetectionTime = millis();
+    detectionCount++;
+    
+    // Publicar detección
+    publishMotionData(distance);
+    
+    // Activar disuasores
+    activateDeterrents();
+    
+    // Publicar alerta si es múltiple
+    if (detectionCount > 3) {
+      publishAlert(distance);
+    }
+  } else {
+    motionDetected = false;
+    if (millis() - lastDetectionTime > 30000) { // Reset después de 30s
+      detectionCount = 0;
+    }
+  }
+}
+
+void publishMotionData(float distance) {
+  String payload = "{";
+  payload += "\"sensor_id\":\"pest_sensor_01\",";
+  payload += "\"location\":\"cultivo_maiz_norte\",";
+  payload += "\"distance_cm\":" + String(distance) + ",";
+  payload += "\"detection_count\":" + String(detectionCount) + ",";
+  payload += "\"timestamp\":" + String(millis());
+  payload += "}";
+  
+  client.publish(mqtt_topic_motion, payload.c_str());
+}
+
+void activateDeterrents() {
+  // LED Strobe
+  digitalWrite(strobeLed, HIGH);
+  delay(200);
+  digitalWrite(strobeLed, LOW);
+  
+  // Sonido ultrasónico (opcional)
+  tone(speakerPin, 25000, 1000); // 25kHz por 1 segundo
+  
+  Serial.println("Disuasores activados para plaga detectada");
+}
+```
+
+### 2. Procesador MQTT a InfluxDB
+
+```python
+import paho.mqtt.client as mqtt
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+import json
+from datetime import datetime
+import requests
+
+# Configuración
+INFLUXDB_URL = "http://localhost:8086"
+INFLUXDB_TOKEN = "your-token"
+INFLUXDB_ORG = "pest_control"
+INFLUXDB_BUCKET = "pest_monitoring"
+
+TELEGRAM_BOT_TOKEN = "your_bot_token"
+TELEGRAM_CHAT_ID = "farmer_chat_id"
+
+client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+write_api = client.write_api(write_options=SYNCHRONOUS)
+
+detection_history = {}
+
+def on_message(client, userdata, msg):
+    try:
+        topic = msg.topic
+        payload = json.loads(msg.payload.decode())
+        
+        if "pest/motion" in topic:
+            process_motion_data(payload)
+        elif "pest/alert" in topic:
+            process_alert_data(payload)
+            
+    except Exception as e:
+        print(f"Error procesando mensaje: {e}")
+
+def process_motion_data(data):
+    # Guardar en InfluxDB
+    point = Point("pest_detection") \
+        .tag("sensor_id", data["sensor_id"]) \
+        .tag("location", data["location"]) \
+        .field("distance", data["distance_cm"]) \
+        .field("detection_count", data["detection_count"])
+    
+    write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+    
+    # Análisis de patrones
+    analyze_detection_patterns(data)
+
+def analyze_detection_patterns(data):
+    sensor_id = data["sensor_id"]
+    current_time = datetime.now()
+    
+    # Inicializar historial si no existe
+    if sensor_id not in detection_history:
+        detection_history[sensor_id] = []
+    
+    # Agregar detección actual
+    detection_history[sensor_id].append(current_time)
+    
+    # Limpiar detecciones antiguas (últimas 2 horas)
+    detection_history[sensor_id] = [
+        dt for dt in detection_history[sensor_id] 
+        if (current_time - dt).total_seconds() < 7200
+    ]
+    
+    # Verificar actividad sospechosa
+    if len(detection_history[sensor_id]) >= 5:
+        send_telegram_alert(
+            f"🚨 ALTA ACTIVIDAD DE PLAGAS\n"
+            f"📍 Ubicación: {data['location']}\n"
+            f"🔢 Detecciones: {len(detection_history[sensor_id])} en 2h\n"
+            f"📏 Distancia promedio: {data['distance_cm']}cm\n"
+            f"⏰ Hora: {current_time.strftime('%H:%M')}"
+        )
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        print(f"Alerta enviada: {response.status_code}")
+    except Exception as e:
+        print(f"Error enviando alerta: {e}")
+
+# Configurar cliente MQTT
+mqtt_client = mqtt.Client()
+mqtt_client.on_message = on_message
+mqtt_client.connect("localhost", 1883, 60)
+mqtt_client.subscribe("pest/#")
+mqtt_client.loop_forever()
+```
+
+### 3. Configuración de Dashboard Grafana
+
+```json
+{
+  "dashboard": {
+    "title": "Sistema Control de Plagas - Monitoreo",
+    "panels": [
+      {
+        "title": "Detecciones por Hora",
+        "type": "graph",
+        "targets": [
+          {
+            "query": "from(bucket: \"pest_monitoring\") |> range(start: -24h) |> filter(fn: (r) => r._measurement == \"pest_detection\") |> aggregateWindow(every: 1h, fn: count) |> group(columns: [\"location\"])"
+          }
+        ]
+      },
+      {
+        "title": "Distancia Promedio de Detección",
+        "type": "stat",
+        "targets": [
+          {
+            "query": "from(bucket: \"pest_monitoring\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"pest_detection\" and r._field == \"distance\") |> mean()"
+          }
+        ],
+        "thresholds": {
+          "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 150},
+            {"color": "red", "value": 50}
+          ]
+        }
+      },
+      {
+        "title": "Mapa de Calor de Actividad",
+        "type": "heatmap",
+        "targets": [
+          {
+            "query": "from(bucket: \"pest_monitoring\") |> range(start: -7d) |> filter(fn: (r) => r._measurement == \"pest_detection\") |> aggregateWindow(every: 1h, fn: count)"
+          }
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "location",
+          "type": "query",
+          "query": "SHOW TAG VALUES FROM \"pest_detection\" WITH KEY = \"location\""
+        }
+      ]
+    }
+  }
+}
+```
+
+### 4. Sistema Avanzado de Disuasión
+
+```python
+class PestDeterrentSystem:
+    def __init__(self):
+        self.deterrent_modes = {
+            "low": ["strobe_light"],
+            "medium": ["strobe_light", "ultrasonic_sound"],
+            "high": ["strobe_light", "ultrasonic_sound", "water_spray"]
+        }
+        self.night_mode = False
+        
+    def determine_deterrent_level(self, detection_data):
+        """Determinar nivel de disuasión basado en patrones"""
+        detection_count = detection_data.get('detection_count', 0)
+        distance = detection_data.get('distance_cm', 0)
+        time_of_day = datetime.now().hour
+        
+        # Modo nocturno (más agresivo)
+        self.night_mode = 18 <= time_of_day <= 6
+        
+        if detection_count > 10 or distance < 30:
+            return "high"
+        elif detection_count > 5 or (distance < 100 and self.night_mode):
+            return "medium"
+        else:
+            return "low"
+    
+    def activate_deterrents(self, level, sensor_id):
+        """Activar disuasores según nivel"""
+        deterrents = self.deterrent_modes[level]
+        
+        message = f"🔧 ACTIVANDO DISUASORES - Nivel {level.upper()}\n"
+        message += f"📍 Sensor: {sensor_id}\n"
+        message += f"🎯 Métodos: {', '.join(deterrents)}\n"
+        
+        # Publicar comando MQTT para activar disuasores
+        mqtt_client.publish(
+            f"pest/control/{sensor_id}",
+            json.dumps({
+                "level": level,
+                "deterrents": deterrents,
+                "duration": 30 if level == "high" else 15
+            })
+        )
+        
+        return message
+```
+
+## 📊 Métricas y Umbrales
+
+| Parámetro | Normal | Alerta Leve | Alerta Alta |
+|-----------|---------|-------------|-------------|
+| Detecciones/hora | 0-2 | 3-5 | >5 |
+| Distancia promedio | >150cm | 50-150cm | <50cm |
+| Actividad nocturna | 0-1 | 2-3 | >3 |
+
+## 🚀 Instalación y Configuración
+
+### Hardware Requerido
+```bash
+Componentes:
+- NodeMCU ESP32 x3
+- Sensores PIR HC-SR501 x3
+- Sensores ultrasónicos HC-SR04 x3
+- Módulo relé 5V
+- LEDs de alta potencia
+- Altavoz piezoeléctrico
+- Fuente alimentación 12V
+```
+
+### Configuración Software
+```docker
+# docker-compose.yml
+version: '3.8'
+services:
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  influxdb_data:
+  grafana_data:
+```
+
+## 🌱 Aplicación en Diferentes Cultivos
+
+| Cultivo | Plaga Común | Configuración Recomendada |
+|---------|-------------|---------------------------|
+| Maíz | Roedores, aves | Sensores a 50cm altura, modo nocturno alto |
+| Hortalizas | Insectos, conejos | Sensores bajos, ultrasonido frecuente |
+| Frutales | Aves, murciélagos | Sensores altos, sprinklers de agua |
+| Granos | Roedores | Barrera perimetral, múltiples sensores |
+
+## 📈 Beneficios Esperados
+
+- **Reducción de pérdidas**: Hasta 40% menos daños por plagas
+- **Alertas tempranas**: Detección antes de daños significativos
+- **Método ecológico**: Reduce uso de pesticidas
+- **Monitoreo 24/7**: Operación continua día y noche
+- **Datos históricos**: Patrones estacionales de plagas
+
+## 📁 Estructura del Repositorio
+
+```
+pest-control-iot/
+├── hardware/
+│   ├── esp32_sensor/
+│   ├── esp32_camera/
+│   └── schematics/
+├── software/
+│   ├── mqtt_processor/
+│   ├── alert_system/
+│   └── deterrent_controller/
+├── dashboards/
+│   └── grafana_pest_control.json
+├── docs/
+│   ├── installation_guide.md
+│   └── crop_specific_configs.md
+├── datasets/
+│   └── sample_pest_activity.csv
+└── docker-compose.yml
+```
+
+---
+
+**🎯 Este sistema proporciona una solución integral para el control ecológico de plagas, combinando detección inteligente con métodos de disuasión no letales para proteger cultivos de manera sostenible.**
